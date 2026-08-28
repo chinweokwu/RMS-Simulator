@@ -1,0 +1,17 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Enterprise RMS SOAP Server Simulator
+# Runs: simulate_soap_server.py
+# Port: 8090
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+LABEL maintainer="EOS Platform Team"
+LABEL description="Live Production Enterprise RMS SOAP Server Simulator (2,000 Sites)"
+
+WORKDIR /app
+
+COPY simulate_soap_server.py .
+
+EXPOSE 8090
+
+CMD ["python3", "simulate_soap_server.py", "--port", "8090", "--sites", "2000", "--push"]

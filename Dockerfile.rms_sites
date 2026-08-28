@@ -1,0 +1,15 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Galooli / Multi-Vendor RMS Site Pusher Simulator
+# Runs: simulate_rms_sites.py
+# Pushes JSON/SOAP telemetry to EOS Gateway
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+LABEL maintainer="EOS Platform Team"
+LABEL description="Live Production Multi-Vendor Galooli & RMS Site Simulator (2,000 Sites)"
+
+WORKDIR /app
+
+COPY simulate_rms_sites.py .
+
+CMD ["python3", "simulate_rms_sites.py", "--sites", "2000", "--mode", "normal", "--workers", "16"]
