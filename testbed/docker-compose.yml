@@ -1,0 +1,77 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  EOS — RMS Simulators Stack (TESTBED - 100 SITES)
+#  Target environment: Local Workstation / Dev Laptop
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Enterprise SOAP Server ──
+  soap-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.soap_server
+    container_name: eos-soap-rms-server-testbed
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      - GATEWAY_URL=${GATEWAY_URL:-http://host.docker.internal:8081/ingress/rms/soap}
+    command: >
+      python3 simulate_soap_server.py
+        --port 8090
+        --sites 100
+        --push
+        --gateway ${GATEWAY_URL:-http://host.docker.internal:8081/ingress/rms/soap}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/soap/AlarmService?wsdl', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - rms-net
+
+  # ── Galooli / Multi-Vendor JSON Pusher ──
+  rms-pusher:
+    build:
+      context: .
+      dockerfile: Dockerfile.rms_sites
+    container_name: eos-galooli-rms-pusher-testbed
+    restart: unless-stopped
+    depends_on:
+      soap-server:
+        condition: service_healthy
+    environment:
+      - GATEWAY_URL=${GATEWAY_URL:-http://host.docker.internal:8081/ingress/rms/alarms}
+    command: >
+      python3 simulate_rms_sites.py
+        --sites 100
+        --mode normal
+        --workers 4
+        --gateway ${GATEWAY_URL:-http://host.docker.internal:8081/ingress/rms/alarms}
+    networks:
+      - rms-net
+
+  # ── Regional Alarm Storm (on-demand) ──
+  rms-storm:
+    build:
+      context: .
+      dockerfile: Dockerfile.rms_sites
+    container_name: eos-rms-storm-testbed
+    profiles:
+      - storm
+    environment:
+      - GATEWAY_URL=${GATEWAY_URL:-http://host.docker.internal:8081/ingress/rms/alarms}
+    command: >
+      python3 simulate_rms_sites.py
+        --sites 100
+        --mode storm
+        --workers 8
+        --gateway ${GATEWAY_URL:-http://host.docker.internal:8081/ingress/rms/alarms}
+    networks:
+      - rms-net
+
+networks:
+  rms-net:
+    driver: bridge
