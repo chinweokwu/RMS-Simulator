@@ -78,6 +78,14 @@ LIVE_ALARM_CATALOG = [
         "desc": "Shelter perimeter magnetic door contact broken without valid RFID technician check-in",
         "root_cause": "UNAUTHORIZED_ACCESS",
         "sla_target_minutes": 15
+    },
+    {
+        "code": "RTU_REBOOT_POWER_RECOVERY",
+        "severity": "MAJOR",
+        "category": "SYSTEM_HARDWARE",
+        "desc": "RTU controller booted up after total site blackout & communication loss",
+        "root_cause": "POWER_RECOVERY_REBOOT",
+        "sla_target_minutes": 30
     }
 ]
 
@@ -125,22 +133,74 @@ class PersistentGalooliSite:
         self.hvac_status = "RUNNING"
         self.door_contact = "CLOSED"
 
-        # Alarm Lifecycle State Machine
+        # Alarm Lifecycle & Comm Loss State Machine
         self.active_alarm = None
+        self.is_offline = False
+        self.offline_since_epoch = 0.0
 
     def tick(self) -> dict:
         """
-        Wall-clock alarm lifecycle:
-          RAISED  -> ACKNOWLEDGED after 30 real minutes
-          CLEARED -> alarm deleted from memory after 2 real hours (saves server space)
+        Wall-clock alarm lifecycle & Communication Loss (Ball Drop):
+          - 1.5% chance to trigger Total Comm Loss (0V DC / offline) -> 0 requests sent for 15 mins
+          - When site recovers, it fires RTU_REBOOT_POWER_RECOVERY alarm before returning to normal
+          - RAISED -> ACKNOWLEDGED after 30 real minutes
+          - CLEARED -> alarm deleted from memory after 2 real hours
         """
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
 
+        # Handle Total Comm Loss (Ball Drop) State
+        if self.is_offline:
+            elapsed_minutes = (now.timestamp() - self.offline_since_epoch) / 60.0
+            if elapsed_minutes < 15.0:
+                # Still offline: send ZERO requests!
+                return None
+            else:
+                # 15 mins passed -> Site Power / Network Restores!
+                self.is_offline = False
+                
+                # Restore healthy telemetry
+                self.grid_status = "HEALTHY"
+                self.phase_a_v = round(random.uniform(220.0, 240.0), 1)
+                self.phase_b_v = round(random.uniform(218.0, 238.0), 1)
+                self.phase_c_v = round(random.uniform(221.0, 241.0), 1)
+                self.gen_status = "OFF"
+                self.dc_bus_v = round(random.uniform(52.8, 54.4), 1)
+                self.soc_pct = round(random.uniform(88.0, 99.5), 1)
+                self.shelter_temp = round(random.uniform(22.0, 26.8), 1)
+                self.hvac_status = "RUNNING"
+                self.door_contact = "CLOSED"
+
+                # Fire Power Recovery Reboot Alarm payload BEFORE continuing normal heartbeats!
+                reboot_def = LIVE_ALARM_CATALOG[-1] # RTU_REBOOT_POWER_RECOVERY
+                self.active_alarm = {
+                    "event_id": f"galooli-prod-{uuid.uuid4().hex[:12]}",
+                    "correlation_id": f"corr-cluster-{random.randint(100, 999)}",
+                    "code": reboot_def["code"],
+                    "category": reboot_def["category"],
+                    "severity": reboot_def["severity"],
+                    "status": "ACTIVE_RAISED",
+                    "desc": reboot_def["desc"],
+                    "root_cause": reboot_def["root_cause"],
+                    "sla_target_minutes": reboot_def["sla_target_minutes"],
+                    "raised_at": now_iso,
+                    "raised_epoch": now.timestamp()
+                }
+                return {"event_type": "ALARM_RAISED", "alarm": self.active_alarm.copy()}
+
         if self.active_alarm is None:
-            # 3% chance of raising alarm, otherwise send HEARTBEAT telemetry ping
-            if random.random() < 0.03:
-                alarm_def = random.choice(LIVE_ALARM_CATALOG)
+            # 1.5% chance to trigger total communication loss (Ball Drop)
+            if random.random() < 0.015:
+                self.is_offline = True
+                self.offline_since_epoch = now.timestamp()
+                self.grid_status = "OUTAGE_TOTAL"
+                self.phase_a_v = 0.0; self.phase_b_v = 0.0; self.phase_c_v = 0.0
+                self.dc_bus_v = 0.0; self.soc_pct = 0.0
+                return None  # Total Silence — zero traffic sent!
+
+            # 3% chance of raising standard alarm
+            elif random.random() < 0.03:
+                alarm_def = random.choice(LIVE_ALARM_CATALOG[:-1])
                 self.active_alarm = {
                     "event_id": f"galooli-prod-{uuid.uuid4().hex[:12]}",
                     "correlation_id": f"corr-cluster-{random.randint(100, 999)}",
@@ -152,24 +212,17 @@ class PersistentGalooliSite:
                     "root_cause": alarm_def["root_cause"],
                     "sla_target_minutes": alarm_def["sla_target_minutes"],
                     "raised_at": now_iso,
-                    "raised_epoch": now.timestamp()  # wall-clock reference
+                    "raised_epoch": now.timestamp()
                 }
                 # Fault impact on live telemetry
                 if "BLACKOUT" in alarm_def["code"]:
-                    self.grid_status = "OUTAGE"
-                    self.phase_a_v = 0.0
-                    self.phase_b_v = 0.0
-                    self.phase_c_v = 0.0
-                    self.gen_status = "RUNNING"
+                    self.grid_status = "OUTAGE"; self.phase_a_v = 0.0; self.phase_b_v = 0.0; self.phase_c_v = 0.0; self.gen_status = "RUNNING"
                 elif "BATTERY" in alarm_def["code"]:
-                    self.dc_bus_v = round(random.uniform(40.5, 42.6), 1)
-                    self.soc_pct = round(random.uniform(9.0, 14.0), 1)
+                    self.dc_bus_v = round(random.uniform(40.5, 42.6), 1); self.soc_pct = round(random.uniform(9.0, 14.0), 1)
                 elif "FUEL" in alarm_def["code"]:
-                    self.fuel_pct = round(random.uniform(7.0, 15.0), 1)
-                    self.fuel_vol_l = round((self.fuel_pct / 100.0) * self.tank_capacity_l, 1)
+                    self.fuel_pct = round(random.uniform(7.0, 15.0), 1); self.fuel_vol_l = round((self.fuel_pct / 100.0) * self.tank_capacity_l, 1)
                 elif "TEMP" in alarm_def["code"]:
-                    self.shelter_temp = round(random.uniform(45.5, 51.5), 1)
-                    self.hvac_status = "COMPRESSOR_FAULT"
+                    self.shelter_temp = round(random.uniform(45.5, 51.5), 1); self.hvac_status = "COMPRESSOR_FAULT"
 
                 return {"event_type": "ALARM_RAISED", "alarm": self.active_alarm.copy()}
             else:
@@ -207,13 +260,13 @@ class PersistentGalooliSite:
 
     def build_galooli_json(self, event_data: dict) -> dict:
         now_iso = datetime.now(timezone.utc).isoformat()
-        alarm = event_data["alarm"]
+        alarm = event_data["alarm"] if event_data else None
 
         return {
             "vendor": "Galooli_RMM",
             "environment": "PRODUCTION_LIVE",
             "schema_version": "v3.2-production",
-            "event_type": event_data["event_type"],
+            "event_type": event_data["event_type"] if event_data else "COMMUNICATION_LOST",
             "event_id": alarm["event_id"] if alarm else f"ping-{uuid.uuid4().hex[:8]}",
             "correlation_id": alarm.get("correlation_id", "N/A") if alarm else "N/A",
             "timestamp": now_iso,
@@ -230,8 +283,8 @@ class PersistentGalooliSite:
             "rtu_gateway": {
                 "unit_id": f"RTU_GAL_{self.site_id:04d}",
                 "firmware_version": "v5.24.1-galooli-prod",
-                "cellular_signal_rssi_dbm": random.randint(-85, -60),
-                "connection_mode": "4G_LTE_PRIMARY"
+                "cellular_signal_rssi_dbm": -120 if self.is_offline else random.randint(-85, -60),
+                "connection_mode": "DISCONNECTED" if self.is_offline else "4G_LTE_PRIMARY"
             },
             "alarm": {
                 "alarm_code": alarm["code"] if alarm else "SYSTEM_OK",
@@ -311,6 +364,10 @@ def push_site_event(site_id: int, gateway_url: str) -> tuple[int, int, str, floa
     with STATE_LOCK:
         site_obj = PERSISTENT_SITES[site_id]
         event_data = site_obj.tick()
+
+    if event_data is None:
+        # Total Comm Loss (Ball Drop) — site sends ZERO requests!
+        return site_id, 0, "OFFLINE_COMM_LOSS", 0.0
 
     payload_json = site_obj.build_galooli_json(event_data)
     payload_str = json.dumps(payload_json)

@@ -33,6 +33,7 @@ LIVE_ALARM_CATALOG = [
     {"code": "GEN_FAIL_TO_START_AUTO",       "severity": "CRITICAL", "category": "GENERATOR",        "desc": "ATS commanded Generator #1 to start after grid fail. Crank failed x3.",   "root_cause": "EQUIPMENT_HARDWARE_FAILURE",  "sla_target_minutes": 30},
     {"code": "SHELTER_HIGH_TEMP_ALARM",      "severity": "MAJOR",    "category": "ENVIRONMENT",      "desc": "Shelter temp exceeded limit. HVAC Compressor Fault detected.",             "root_cause": "COOLING_FAILURE",             "sla_target_minutes": 45},
     {"code": "SECURITY_INTRUSION_DOOR_OPEN", "severity": "CRITICAL", "category": "PHYSICAL_SECURITY","desc": "Magnetic door contact broken without valid RFID technician check-in.",      "root_cause": "UNAUTHORIZED_ACCESS",         "sla_target_minutes": 15},
+    {"code": "RTU_REBOOT_POWER_RECOVERY",    "severity": "MAJOR",    "category": "SYSTEM_HARDWARE",  "desc": "RTU controller booted up after total site blackout & comm loss.",          "root_cause": "POWER_RECOVERY_REBOOT",       "sla_target_minutes": 30},
 ]
 
 # ─── Thread-Safe State ────────────────────────────────────────────────────────
@@ -40,7 +41,7 @@ STATE_LOCK     = threading.Lock()
 PERSISTENT_SITES = {}
 ALARM_LOG      = []   # Rolling last 10 lifecycle events
 METRICS        = {"total_events": 0, "critical": 0, "major": 0, "heartbeats": 0,
-                  "raised": 0, "acknowledged": 0, "cleared": 0, "grid_blackouts": 0}
+                  "raised": 0, "acknowledged": 0, "cleared": 0, "grid_blackouts": 0, "comm_loss": 0}
 
 # ─── Persistent Site Class ────────────────────────────────────────────────────
 class PersistentGalooliSite:
@@ -80,20 +81,63 @@ class PersistentGalooliSite:
         self.humidity_pct  = round(random.uniform(42.0, 68.0), 1)
         self.hvac_status   = "RUNNING"
         self.door_contact  = "CLOSED"
-        self.active_alarm  = None
+        
+        self.active_alarm        = None
+        self.is_offline          = False
+        self.offline_since_epoch = 0.0
 
     def tick(self) -> dict:
-        """
-        Wall-clock alarm lifecycle:
-          RAISED  -> ACKNOWLEDGED after 30 real minutes
-          CLEARED -> alarm deleted from memory after 2 real hours (saves server space)
-        """
+        """Wall-clock alarm lifecycle & Comm Loss (Ball Drop)."""
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
 
+        # Handle Total Comm Loss (Ball Drop) State
+        if self.is_offline:
+            elapsed_minutes = (now.timestamp() - self.offline_since_epoch) / 60.0
+            if elapsed_minutes < 15.0:
+                return None  # Still offline: send ZERO requests!
+            else:
+                # 15 mins passed -> Site Power / Network Restores!
+                self.is_offline = False
+                self.grid_status = "HEALTHY"
+                self.phase_a_v = round(random.uniform(220.0, 240.0), 1)
+                self.phase_b_v = round(random.uniform(218.0, 238.0), 1)
+                self.phase_c_v = round(random.uniform(221.0, 241.0), 1)
+                self.gen_status = "OFF"
+                self.dc_bus_v = round(random.uniform(52.8, 54.4), 1)
+                self.soc_pct = round(random.uniform(88.0, 99.5), 1)
+                self.shelter_temp = round(random.uniform(22.0, 26.8), 1)
+                self.hvac_status = "RUNNING"; self.door_contact = "CLOSED"
+
+                # Fire Power Recovery Reboot Alarm payload BEFORE continuing normal heartbeats!
+                reboot_def = LIVE_ALARM_CATALOG[-1]
+                self.active_alarm = {
+                    "event_id": f"galooli-prod-{uuid.uuid4().hex[:12]}",
+                    "code": reboot_def["code"],
+                    "category": reboot_def["category"],
+                    "severity": reboot_def["severity"],
+                    "status": "ACTIVE_RAISED",
+                    "desc": reboot_def["desc"],
+                    "root_cause": reboot_def["root_cause"],
+                    "sla_target_minutes": reboot_def["sla_target_minutes"],
+                    "raised_at": now_iso,
+                    "raised_epoch": now.timestamp()
+                }
+                return {"event_type": "ALARM_RAISED", "alarm": self.active_alarm.copy()}
+
         if self.active_alarm is None:
-            if random.random() < 0.03:
-                alarm_def = random.choice(LIVE_ALARM_CATALOG)
+            # 1.5% chance to trigger total communication loss (Ball Drop)
+            if random.random() < 0.015:
+                self.is_offline = True
+                self.offline_since_epoch = now.timestamp()
+                self.grid_status = "OUTAGE_TOTAL"
+                self.phase_a_v = 0.0; self.phase_b_v = 0.0; self.phase_c_v = 0.0
+                self.dc_bus_v = 0.0; self.soc_pct = 0.0
+                return None  # Total Silence — zero traffic sent!
+
+            # 3% chance of raising standard alarm
+            elif random.random() < 0.03:
+                alarm_def = random.choice(LIVE_ALARM_CATALOG[:-1])
                 self.active_alarm = {
                     "event_id":   f"galooli-prod-{uuid.uuid4().hex[:12]}",
                     "code":       alarm_def["code"],
@@ -104,7 +148,7 @@ class PersistentGalooliSite:
                     "root_cause": alarm_def["root_cause"],
                     "sla_target_minutes": alarm_def["sla_target_minutes"],
                     "raised_at":  now_iso,
-                    "raised_epoch": now.timestamp()  # wall-clock reference
+                    "raised_epoch": now.timestamp()
                 }
                 if "BLACKOUT" in alarm_def["code"]:
                     self.grid_status = "OUTAGE";  self.phase_a_v = 0.0; self.phase_b_v = 0.0; self.phase_c_v = 0.0; self.gen_status = "RUNNING"
@@ -148,6 +192,12 @@ def simulation_engine(sites_count: int):
         with STATE_LOCK:
             site_obj = PERSISTENT_SITES[site_id]
             event_data = site_obj.tick()
+
+        if event_data is None:
+            with STATE_LOCK:
+                METRICS["comm_loss"] += 1
+            time.sleep(0.02)
+            continue
 
         et = event_data["event_type"]
         alarm = event_data["alarm"]
@@ -253,8 +303,9 @@ def render_dashboard(sites_count: int):
         a = spotlight.active_alarm
         st_colors = {"ACTIVE_RAISED": "\033[91m", "ACKNOWLEDGED": "\033[93m", "CLEARED": "\033[92m"}
         sc = st_colors.get(a["status"], "\033[97m")
+        elapsed_m = round((datetime.now(timezone.utc).timestamp() - a.get('raised_epoch', datetime.now(timezone.utc).timestamp())) / 60, 1)
         print(f"\n   \033[91m⚠ ACTIVE ALARM\033[0m  {sc}{a['status']}\033[0m  |  {a['code']}  |  Root Cause: {a['root_cause']}")
-        print(f"            SLA Target: {a['sla_target_minutes']} min  |  Raised: {a.get('raised_at','—')[:19].replace('T',' ')}  |  Ticks: {a['ticks_active']}")
+        print(f"            SLA Target: {a['sla_target_minutes']} min  |  Raised: {a.get('raised_at','—')[:19].replace('T',' ')}  |  Active: {elapsed_m} min")
     else:
         print(f"\n   \033[92m✓ No active alarm — Site operating normally (HEARTBEAT)\033[0m")
 

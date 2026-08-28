@@ -85,6 +85,14 @@ LIVE_ALARM_CATALOG = [
         "desc": "Shelter perimeter magnetic door contact broken without valid RFID technician check-in",
         "root_cause_type": "UNAUTHORIZED_ACCESS",
         "sla_target_minutes": 15
+    },
+    {
+        "code": "RTU_REBOOT_POWER_RECOVERY",
+        "severity": "MAJOR",
+        "category": "SYSTEM_HARDWARE",
+        "desc": "RTU controller booted up after total site blackout & communication loss",
+        "root_cause_type": "POWER_RECOVERY_REBOOT",
+        "sla_target_minutes": 30
     }
 ]
 
@@ -200,20 +208,76 @@ class SiteState:
 
         # Active Alarm Lifecycle Management
         self.active_alarm = None  # None or dict: {code, severity, status, event_id, raised_at}
+        self.is_offline = False
+        self.offline_since_epoch = 0.0
 
     def simulate_tick(self) -> dict:
         """
-        Wall-clock alarm lifecycle:
-          RAISED  -> ACKNOWLEDGED after 30 real minutes
-          CLEARED -> alarm deleted from memory after 2 real hours (saves server space)
+        Wall-clock alarm lifecycle & Communication Loss (Ball Drop):
+          - 1.5% chance to trigger Total Comm Loss (0V DC / offline) -> 0 requests sent for 15 mins
+          - When site recovers, it fires RTU_REBOOT_POWER_RECOVERY alarm before returning to normal
+          - RAISED  -> ACKNOWLEDGED after 30 real minutes
+          - CLEARED -> alarm deleted from memory after 2 real hours
         """
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         event_generated = None
 
+        # Handle Total Comm Loss (Ball Drop) State
+        if self.is_offline:
+            elapsed_minutes = (now.timestamp() - self.offline_since_epoch) / 60.0
+            if elapsed_minutes < 15.0:
+                # Still offline: send ZERO requests!
+                return None
+            else:
+                # 15 mins passed -> Site Power / Network Restores!
+                self.is_offline = False
+                
+                # Restore healthy baseline telemetry
+                self.grid_status = "HEALTHY"
+                self.phase_a_v = round(random.uniform(222.0, 240.0), 1)
+                self.phase_b_v = round(random.uniform(220.0, 238.0), 1)
+                self.phase_c_v = round(random.uniform(223.0, 241.0), 1)
+                self.grid_freq = round(random.uniform(49.8, 50.2), 2)
+                self.gen_status = "OFF"
+                self.gen_coolant_temp = 30.0
+                self.dc_bus_v = round(random.uniform(52.5, 54.0), 1)
+                self.soc_pct = round(random.uniform(88.0, 99.0), 1)
+                self.autonomy_mins = 360
+                self.shelter_temp = round(random.uniform(22.0, 26.5), 1)
+                self.hvac_status = "RUNNING"
+                self.door_contact = "CLOSED"
+
+                # Fire Power Recovery Reboot Alarm payload BEFORE continuing normal heartbeats!
+                reboot_def = LIVE_ALARM_CATALOG[-1] # RTU_REBOOT_POWER_RECOVERY
+                self.active_alarm = {
+                    "event_id": f"evt-prod-{uuid.uuid4().hex[:12]}",
+                    "correlation_id": f"corr-cluster-{random.randint(100, 999)}",
+                    "code": reboot_def["code"],
+                    "category": reboot_def["category"],
+                    "severity": reboot_def["severity"],
+                    "status": "RAISED",
+                    "desc": reboot_def["desc"],
+                    "root_cause": reboot_def["root_cause_type"],
+                    "sla_target_minutes": reboot_def["sla_target_minutes"],
+                    "raised_at": now_iso,
+                    "raised_epoch": now.timestamp()
+                }
+                return {"type": "ALARM_RAISED", "alarm": self.active_alarm.copy()}
+
         if self.active_alarm is None:
-            if random.random() < 0.02:
-                alarm_def = random.choice(LIVE_ALARM_CATALOG)
+            # 1.5% chance to trigger total communication loss (Ball Drop)
+            if random.random() < 0.015:
+                self.is_offline = True
+                self.offline_since_epoch = now.timestamp()
+                self.grid_status = "OUTAGE_TOTAL"
+                self.phase_a_v = 0.0; self.phase_b_v = 0.0; self.phase_c_v = 0.0
+                self.dc_bus_v = 0.0; self.soc_pct = 0.0
+                return None  # Total Silence — zero traffic sent!
+
+            # 2% chance per tick to raise standard alarm
+            elif random.random() < 0.02:
+                alarm_def = random.choice(LIVE_ALARM_CATALOG[:-1])
                 self.active_alarm = {
                     "event_id": f"evt-prod-{uuid.uuid4().hex[:12]}",
                     "correlation_id": f"corr-cluster-{random.randint(100, 999)}",
@@ -225,27 +289,17 @@ class SiteState:
                     "root_cause": alarm_def["root_cause_type"],
                     "sla_target_minutes": alarm_def["sla_target_minutes"],
                     "raised_at": now_iso,
-                    "raised_epoch": now.timestamp()  # wall-clock reference
+                    "raised_epoch": now.timestamp()
                 }
                 # Apply fault impact on telemetry
                 if "BLACKOUT" in alarm_def["code"]:
-                    self.grid_status = "OUTAGE"
-                    self.phase_a_v = 0.0
-                    self.phase_b_v = 0.0
-                    self.phase_c_v = 0.0
-                    self.grid_freq = 0.0
-                    self.gen_status = "RUNNING"
-                    self.gen_coolant_temp = 89.5
+                    self.grid_status = "OUTAGE"; self.phase_a_v = 0.0; self.phase_b_v = 0.0; self.phase_c_v = 0.0; self.grid_freq = 0.0; self.gen_status = "RUNNING"; self.gen_coolant_temp = 89.5
                 elif "BATTERY" in alarm_def["code"]:
-                    self.dc_bus_v = round(random.uniform(40.2, 42.5), 1)
-                    self.soc_pct = round(random.uniform(9.0, 14.0), 1)
-                    self.autonomy_mins = 20
+                    self.dc_bus_v = round(random.uniform(40.2, 42.5), 1); self.soc_pct = round(random.uniform(9.0, 14.0), 1); self.autonomy_mins = 20
                 elif "FUEL" in alarm_def["code"]:
-                    self.fuel_pct = round(random.uniform(6.0, 14.0), 1)
-                    self.fuel_vol_l = round((self.fuel_pct / 100.0) * self.tank_capacity_l, 1)
+                    self.fuel_pct = round(random.uniform(6.0, 14.0), 1); self.fuel_vol_l = round((self.fuel_pct / 100.0) * self.tank_capacity_l, 1)
                 elif "TEMP" in alarm_def["code"]:
-                    self.shelter_temp = round(random.uniform(45.0, 52.0), 1)
-                    self.hvac_status = "COMPRESSOR_FAULT"
+                    self.shelter_temp = round(random.uniform(45.0, 52.0), 1); self.hvac_status = "COMPRESSOR_FAULT"
                 elif "DOOR" in alarm_def["code"]:
                     self.door_contact = "UNAUTHORIZED_OPEN"
 
