@@ -330,6 +330,99 @@ class PersistentGalooliSite:
             }
         }
 
+    def to_soap_xml(self, event_data: dict) -> str:
+        """Serializes current persistent site state and alarm event into SOAP XML Envelope."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        alarm = event_data.get("alarm") if event_data else None
+        event_id = alarm["event_id"] if alarm else f"ping-{uuid.uuid4().hex[:12]}"
+        correlation_id = alarm.get("correlation_id", f"corr-cluster-{random.randint(100, 999)}") if alarm else "N/A"
+        alarm_code = alarm["code"] if alarm else "HEARTBEAT_KEEPALIVE_PING"
+        category = alarm["category"] if alarm else "TELEMETRY_HEARTBEAT"
+        severity = alarm["severity"] if alarm else "INFO"
+        status = alarm["status"] if alarm else "NORMAL"
+        desc = alarm["desc"] if alarm else "Periodic telemetry keepalive ping"
+        root_cause = alarm.get("root_cause", "SYSTEM_HEALTHY") if alarm else "NONE"
+        sla_target = alarm.get("sla_target_minutes", 0) if alarm else 0
+
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:rms="http://rms.telecom.enterprise/services/AlarmService">
+   <soapenv:Header>
+      <rms:SecurityHeader>
+         <rms:AccountID>ACC_TELECOM_OPERATOR_01</rms:AccountID>
+         <rms:AuthToken>BEARER-PROD-TOKEN-SITE-{self.site_id:04d}-ACTIVE</rms:AuthToken>
+         <rms:MessageID>{event_id}</rms:MessageID>
+         <rms:CorrelationID>{correlation_id}</rms:CorrelationID>
+      </rms:SecurityHeader>
+   </soapenv:Header>
+   <soapenv:Body>
+      <rms:RaiseProductionSiteAlarmRequest>
+         <rms:SiteMetadata>
+            <rms:SiteID>{self.site_code}</rms:SiteID>
+            <rms:SiteName>{self.site_name}</rms:SiteName>
+            <rms:SiteType>{self.site_type}</rms:SiteType>
+            <rms:SLATier>{self.sla_tier}</rms:SLATier>
+            <rms:Region>{self.region}</rms:Region>
+            <rms:Coordinates lat="{self.lat}" lng="{self.lng}"/>
+            <rms:MaintenanceVendor>{self.vendor}</rms:MaintenanceVendor>
+            <rms:AssignedEngineer>{self.engineer}</rms:AssignedEngineer>
+         </rms:SiteMetadata>
+
+         <rms:AlarmEvent>
+            <rms:EventID>{event_id}</rms:EventID>
+            <rms:AlarmCode>{alarm_code}</rms:AlarmCode>
+            <rms:Category>{category}</rms:Category>
+            <rms:Severity>{severity}</rms:Severity>
+            <rms:Status>{status}</rms:Status>
+            <rms:FirstOccurrenceTime>{alarm.get("raised_at", now_iso) if alarm else now_iso}</rms:FirstOccurrenceTime>
+            <rms:LastUpdatedTime>{now_iso}</rms:LastUpdatedTime>
+            <rms:SLAResponseTargetMinutes>{sla_target}</rms:SLAResponseTargetMinutes>
+            <rms:Description>{desc}</rms:Description>
+            <rms:RootCauseType>{root_cause}</rms:RootCauseType>
+         </rms:AlarmEvent>
+
+         <rms:LiveTelemetrySnapshot>
+            <rms:ACPowerGrid>
+               <rms:GridStatus>{self.grid_status}</rms:GridStatus>
+               <rms:PhaseAVoltage unit="V">{self.phase_a_v}</rms:PhaseAVoltage>
+               <rms:PhaseBVoltage unit="V">{self.phase_b_v}</rms:PhaseBVoltage>
+               <rms:PhaseCVoltage unit="V">{self.phase_c_v}</rms:PhaseCVoltage>
+               <rms:Frequency unit="Hz">{self.grid_freq}</rms:Frequency>
+            </rms:ACPowerGrid>
+
+            <rms:GeneratorSubsystem>
+               <rms:EngineStatus>{self.gen_status}</rms:EngineStatus>
+               <rms:FuelLevelPercent unit="%">{self.fuel_pct}</rms:FuelLevelPercent>
+               <rms:FuelVolumeLiters unit="L">{self.fuel_vol_l}</rms:FuelVolumeLiters>
+               <rms:TankCapacityLiters unit="L">{self.tank_capacity_l}</rms:TankCapacityLiters>
+               <rms:CoolantTemp unit="C">{self.gen_coolant_temp}</rms:CoolantTemp>
+               <rms:OilPressure unit="Bar">{self.gen_oil_pressure}</rms:OilPressure>
+               <rms:BatteryStarterVoltage unit="V">{self.gen_starter_v}</rms:BatteryStarterVoltage>
+               <rms:TotalRunHours>{self.gen_run_hours}</rms:TotalRunHours>
+            </rms:GeneratorSubsystem>
+
+            <rms:BatteryStorageBank>
+               <rms:Chemistry>Lithium_LiFePO4_48V</rms:Chemistry>
+               <rms:DCBusVoltage unit="V">{self.dc_bus_v}</rms:DCBusVoltage>
+               <rms:StateOfChargePercent unit="%">{self.soc_pct}</rms:StateOfChargePercent>
+               <rms:StateOfHealthPercent unit="%">{self.soh_pct}</rms:StateOfHealthPercent>
+               <rms:CurrentDischargeAmps unit="A">{self.dischg_amps}</rms:CurrentDischargeAmps>
+               <rms:EstimatedAutonomyRemainingMinutes>{self.autonomy_mins}</rms:EstimatedAutonomyRemainingMinutes>
+            </rms:BatteryStorageBank>
+
+            <rms:ShelterEnvironment>
+               <rms:AmbientTemperature unit="C">{self.shelter_temp}</rms:AmbientTemperature>
+               <rms:HumidityPercent unit="%">{self.humidity_pct}</rms:HumidityPercent>
+               <rms:HVACUnit1Status>{self.hvac_status}</rms:HVACUnit1Status>
+               <rms:DoorSensorStatus>{self.door_contact}</rms:DoorSensorStatus>
+               <rms:SmokeDetectorStatus>NORMAL</rms:SmokeDetectorStatus>
+               <rms:FloodSensorStatus>NORMAL</rms:FloodSensorStatus>
+            </rms:ShelterEnvironment>
+         </rms:LiveTelemetrySnapshot>
+      </rms:RaiseProductionSiteAlarmRequest>
+   </soapenv:Body>
+</soapenv:Envelope>"""
+
 def initialize_persistent_sites(count: int):
     with STATE_LOCK:
         PERSISTENT_SITES.clear()
@@ -343,7 +436,7 @@ def send_http_request(url: str, payload_data: str, content_type: str) -> tuple[i
         data=payload_data.encode("utf-8"),
         headers={
             "Content-Type": content_type,
-            "Authorization": "Bearer PROD-GALOOLI-SECRET-KEY",
+            "Authorization": "Bearer mqueue_sec_live_2026",
             "User-Agent": "EOS-Production-Site-Simulator/4.0"
         },
         method="POST"
@@ -359,19 +452,27 @@ def send_http_request(url: str, payload_data: str, content_type: str) -> tuple[i
         duration_ms = (time.time() - start_time) * 1000
         return 0, duration_ms
 
-def push_site_event(site_id: int, gateway_url: str) -> tuple[int, int, str, float]:
+def push_site_event(site_id: int, gateway_url: str, fmt: str = "galooli") -> tuple[int, int, str, float]:
     """Helper function executed in thread pool for pushing a single site's telemetry."""
     with STATE_LOCK:
         site_obj = PERSISTENT_SITES[site_id]
         event_data = site_obj.tick()
+        if event_data is None:
+            # Total Comm Loss (Ball Drop) — site sends ZERO requests!
+            return site_id, 0, "OFFLINE_COMM_LOSS", 0.0
 
-    if event_data is None:
-        # Total Comm Loss (Ball Drop) — site sends ZERO requests!
-        return site_id, 0, "OFFLINE_COMM_LOSS", 0.0
+        use_soap = (fmt == "soap") or (fmt == "all" and site_id % 2 == 0)
+        if use_soap:
+            payload_str = site_obj.to_soap_xml(event_data)
+            content_type = "text/xml; charset=utf-8"
+            target_url = gateway_url.replace("/alarms", "/soap") if "/rms/" in gateway_url and not gateway_url.endswith("/soap") else gateway_url
+        else:
+            payload_json = site_obj.build_galooli_json(event_data)
+            payload_str = json.dumps(payload_json)
+            content_type = "application/json"
+            target_url = gateway_url
 
-    payload_json = site_obj.build_galooli_json(event_data)
-    payload_str = json.dumps(payload_json)
-    status_code, duration_ms = send_http_request(gateway_url, payload_str, "application/json")
+    status_code, duration_ms = send_http_request(target_url, payload_str, content_type)
     
     alarm_code = event_data["alarm"]["code"] if event_data["alarm"] else "HEARTBEAT"
     return site_id, status_code, alarm_code, duration_ms
@@ -399,7 +500,7 @@ def run_simulation(sites_count: int, mode: str, gateway_url: str, fmt: str, work
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 while True:
                     # Submit batch of tasks concurrently
-                    futures = [executor.submit(push_site_event, random.randint(1, sites_count), gateway_url) for _ in range(workers)]
+                    futures = [executor.submit(push_site_event, random.randint(1, sites_count), gateway_url, fmt) for _ in range(workers)]
                     for future in concurrent.futures.as_completed(futures):
                         site_id, status_code, alarm_code, duration_ms = future.result()
                         sent += 1
@@ -426,7 +527,7 @@ def run_simulation(sites_count: int, mode: str, gateway_url: str, fmt: str, work
         failed = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(push_site_event, s_id, gateway_url) for s_id in range(1, affected_sites + 1)]
+            futures = [executor.submit(push_site_event, s_id, gateway_url, fmt) for s_id in range(1, affected_sites + 1)]
             for future in concurrent.futures.as_completed(futures):
                 site_id, status_code, alarm_code, duration_ms = future.result()
                 sent += 1

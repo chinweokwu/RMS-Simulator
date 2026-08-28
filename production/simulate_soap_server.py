@@ -555,6 +555,23 @@ class ProductionSOAPHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(fault_xml.encode("utf-8"))
                 return
 
+            # Forward received SOAP XML payload to EOS Gateway MQueue Pipeline
+            def forward_to_gateway(url: str, body: str):
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        data=body.encode("utf-8"),
+                        headers={"Content-Type": "text/xml; charset=utf-8", "Authorization": "Bearer PROD-RMS-SECRET"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=3):
+                        pass
+                except Exception:
+                    pass
+
+            if GATEWAY_URL:
+                threading.Thread(target=forward_to_gateway, args=(GATEWAY_URL, post_body), daemon=True).start()
+
             tx_id = f"tx_prod_soap_{uuid.uuid4().hex[:10]}"
             response_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
@@ -598,7 +615,7 @@ def proactive_background_pusher(gateway_url: str):
                 req = urllib.request.Request(
                     gateway_url,
                     data=soap_xml.encode("utf-8"),
-                    headers={"Content-Type": "application/soap+xml", "Authorization": "Bearer PROD-RMS-SECRET"},
+                    headers={"Content-Type": "text/xml; charset=utf-8", "Authorization": "Bearer PROD-RMS-SECRET"},
                     method="POST"
                 )
                 try:
@@ -606,8 +623,9 @@ def proactive_background_pusher(gateway_url: str):
                         sys_time = datetime.now().strftime("%H:%M:%S")
                         alarm_code = event_data['alarm']['code'] if event_data.get('alarm') else 'HEARTBEAT'
                         print(f"  [{sys_time}] Proactive SOAP Push -> Site #{site_id:04d} | Alarm: {alarm_code:<25} ({event_data['type']}) | Gateway HTTP {resp.status}")
-                except Exception:
-                    pass
+                except Exception as push_err:
+                    sys_time = datetime.now().strftime("%H:%M:%S")
+                    print(f"  [{sys_time}] Proactive SOAP Push Error -> {push_err}")
         except Exception:
             pass
         time.sleep(0.1)
